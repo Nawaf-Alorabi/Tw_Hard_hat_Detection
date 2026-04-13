@@ -1,176 +1,239 @@
-import os
-import cv2
-import numpy as np
-import pandas as pd
-from PIL import Image
 import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import numpy as np
+import cv2
+import tempfile
+import os
+import time
 
-# =========================================
-# 1. PAGE CONFIG & STYLING
-# =========================================
+# ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AquaGuard AI | Drowning Detection",
-    page_icon="🌊",
+    page_title="Hat Detection – YOLOv8",
+    page_icon="⛑️",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# Attempt to import YOLO; handle environment issues gracefully
-try:
-    from ultralytics import YOLO
-except ImportError:
-    st.error("Ultralytics library not found. Please check your requirements.txt.")
-    st.stop()  # Hard stop if library is missing
-
-# Custom CSS for a professional look
+# ─── Custom CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    .feature-card { background-color: #e9ecef; padding: 20px; border-radius: 10px; height: 100%; border-left: 5px solid #007bff; }
-    .strong { font-weight: bold; font-size: 1.1em; color: #1e3a8a; }
-    .tiny-label { font-size: 0.85em; color: #6c757d; margin-top: 5px; }
-    </style>
-    """, unsafe_allow_html=True)
+<style>
+    .main-title {
+        font-size: 2.4rem;
+        font-weight: 800;
+        background: linear-gradient(90deg, #1a73e8, #0d47a1);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0;
+    }
+    .subtitle {
+        color: #555;
+        font-size: 1rem;
+        margin-top: 0;
+    }
+    .metric-card {
+        background: #f0f4ff;
+        border-radius: 12px;
+        padding: 16px 20px;
+        text-align: center;
+        border: 1px solid #d0dff8;
+    }
+    .metric-label { font-size: 0.8rem; color: #666; text-transform: uppercase; }
+    .metric-value { font-size: 1.8rem; font-weight: 700; color: #1a73e8; }
+    .badge-head    { background:#fff3cd; color:#856404; border-radius:6px; padding:3px 10px; font-weight:600; }
+    .badge-helmet  { background:#d1e7dd; color:#0f5132; border-radius:6px; padding:3px 10px; font-weight:600; }
+    .stAlert { border-radius: 10px; }
+</style>
+""", unsafe_allow_html=True)
 
-# =========================================
-# 2. DATA & CONSTANTS
-# =========================================
-PROJECT_NAME = "AquaGuard AI"
-PER_CLASS_METRICS = pd.DataFrame({
-    "Class": ["Drowning", "Swimming"],
-    "Precision": [1.000, 0.966],
-    "Recall": [0.561, 1.000],
-    "mAP50": [0.759, 0.995],
-})
+# ─── Header ─────────────────────────────────────────────────────────────────
+st.markdown('<p class="main-title">⛑️ Hat Detection — YOLOv8 OBB</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Upload an image and let the model detect <b>heads</b> and <b>helmets</b> in real time.</p>', unsafe_allow_html=True)
+st.divider()
 
-# =========================================
-# 3. CORE FUNCTIONS
-# =========================================
-@st.cache_resource
-def load_trained_model():
-    """Loads the YOLO model using an absolute path-safe method."""
-    model_filename = "best.pt"
-    # Use absolute path to avoid file-not-found issues on cloud
-    model_path = os.path.join(os.getcwd(), model_filename)
-    
-    if os.path.exists(model_path):
-        return YOLO(model_path)
-    return None
-
-def process_image(model, image, confidence):
-    """Runs inference on the image and returns the annotated result."""
-    img_array = np.array(image)
-    
-    # Use safer inference call
-    results = model(img_array, conf=confidence)
-    
-    # Generate annotated image
-    res_plotted = results[0].plot()
-    # Convert BGR (OpenCV) to RGB (Streamlit)
-    res_rgb = cv2.cvtColor(res_plotted, cv2.COLOR_BGR2RGB)
-    
-    # Extract detection counts safely
-    counts = {"Drowning": 0, "Swimming": 0}
-    
-    # Safe check for detections
-    if results[0].boxes is not None:
-        for box in results[0].boxes:
-            cls_id = int(box.cls[0])
-            # Use model.names instead of results[0].names for stability
-            label = model.names[cls_id]
-            if label in counts:
-                counts[label] += 1
-            
-    return res_rgb, counts
-
-# =========================================
-# 4. SIDEBAR
-# =========================================
+# ─── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title(f"🌊 {PROJECT_NAME}")
-    st.subheader("Model Settings")
-    
-    conf_threshold = st.slider("Confidence Threshold", 0.1, 1.0, 0.35)
-    
-    st.info("""
-    **Model Specs:**
-    - YOLOv8s-OBB
-    - Python 3.11 Runtime
-    - Optimized for Pool/Beach
-    """)
-    
+    st.header("⚙️ Settings")
+
+    model_path = st.text_input(
+        "Model path (.pt)",
+        value="hat_detection_tuned_best.pt",
+        help="Path to your trained YOLOv8 OBB weights file.",
+    )
+
+    conf_threshold = st.slider(
+        "Confidence threshold", min_value=0.10, max_value=0.95,
+        value=0.25, step=0.05,
+        help="Only show detections above this confidence score."
+    )
+
+    iou_threshold = st.slider(
+        "IoU threshold (NMS)", min_value=0.10, max_value=0.95,
+        value=0.45, step=0.05,
+    )
+
+    show_labels  = st.toggle("Show labels",      value=True)
+    show_conf    = st.toggle("Show confidence",  value=True)
+
     st.divider()
-    st.write("Water Safety Monitoring System")
+    st.markdown("### 📊 Tuned Model Metrics")
+    col1, col2 = st.columns(2)
+    col1.metric("Precision", "0.942")
+    col2.metric("Recall",    "0.876")
+    col1.metric("mAP50",     "0.931")
+    col2.metric("mAP50-95",  "0.758")
 
-# =========================================
-# 5. MAIN UI NAVIGATION
-# =========================================
-st.title("AquaGuard: Intelligent Drowning Detection")
-tab1, tab2, tab3 = st.tabs(["📊 Performance", "🔍 Live Detection", "📄 Technical Report"])
+    st.divider()
+    st.caption("Built with [Ultralytics YOLOv8](https://docs.ultralytics.com) · OBB variant")
 
-# --- TAB 1: OVERVIEW ---
-with tab1:
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Avg Precision", "98.3%", "+24%")
-    col2.metric("Avg Recall", "78.0%", "+9%")
-    col3.metric("mAP50", "0.877", "Improved")
-    col4.metric("Inference Speed", "12ms", "Optimized")
+# ─── Load Model ─────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading model…")
+def load_model(path: str):
+    if not os.path.exists(path):
+        return None, f"❌ Model file not found: `{path}`"
+    try:
+        m = YOLO(path)
+        return m, None
+    except Exception as e:
+        return None, str(e)
 
-    st.subheader("Class-Level Performance")
-    st.table(PER_CLASS_METRICS)
+model, model_error = load_model(model_path)
 
-# --- TAB 2: LIVE DETECTION ---
-with tab2:
-    st.header("Upload Image for Detection")
-    
-    # Load model
-    model = load_trained_model()
-    
-    if model is None:
-        st.warning("⚠️ **'best.pt' not found.** Ensure the model file is in the root directory.")
-        st.stop() # Stop the tab from running if model is missing
+if model_error:
+    st.error(model_error)
+    st.info(
+        "**How to get the model file:**\n"
+        "1. Run the training notebook and download `hat_detection_tuned_best.pt`.\n"
+        "2. Place it in the same folder as this `app.py`.\n"
+        "3. Update the path in the sidebar if needed."
+    )
+    st.stop()
+
+st.success(f"✅ Model loaded: `{model_path}`", icon="🟢")
+
+# ─── Upload & Predict ────────────────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "📤 Upload an image to test",
+    type=["jpg", "jpeg", "png", "bmp", "webp"],
+    help="Drag & drop or click to browse."
+)
+
+if uploaded:
+    pil_img = Image.open(uploaded).convert("RGB")
+    img_np  = np.array(pil_img)
+
+    col_orig, col_pred = st.columns(2, gap="large")
+
+    with col_orig:
+        st.markdown("#### 🖼️ Original Image")
+        st.image(pil_img, use_container_width=True)
+        st.caption(f"Size: {pil_img.width} × {pil_img.height} px")
+
+    with col_pred:
+        st.markdown("#### 🔍 Detection Result")
+
+        with st.spinner("Running inference…"):
+            t0 = time.perf_counter()
+            results = model.predict(
+                source=img_np,
+                conf=conf_threshold,
+                iou=iou_threshold,
+                verbose=False,
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        result = results[0]
+
+        # ── Draw OBB annotations ──────────────────────────────────────────
+        annotated = result.plot(
+            labels=show_labels,
+            conf=show_conf,
+            line_width=2,
+        )
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        st.image(annotated_rgb, use_container_width=True)
+        st.caption(f"⏱️ Inference: {elapsed_ms:.1f} ms")
+
+    # ─── Detection Summary ───────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📋 Detection Summary")
+
+    if result.obb is not None and len(result.obb.cls) > 0:
+        cls_ids = result.obb.cls.cpu().numpy().astype(int)
+        confs   = result.obb.conf.cpu().numpy()
+        names   = [result.names[c] for c in cls_ids]
+
+        head_count   = names.count("head")
+        helmet_count = names.count("helmet")
+
+        m1, m2, m3 = st.columns(3)
+        m1.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Total detections</div>
+            <div class="metric-value">{len(names)}</div>
+        </div>""", unsafe_allow_html=True)
+
+        m2.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">🧠 Heads</div>
+            <div class="metric-value">{head_count}</div>
+        </div>""", unsafe_allow_html=True)
+
+        m3.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">⛑️ Helmets</div>
+            <div class="metric-value">{helmet_count}</div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("#### Per-detection details")
+        rows = []
+        for i, (name, conf) in enumerate(zip(names, confs), 1):
+            badge = f'<span class="badge-{name}">{name}</span>'
+            bar   = f'<progress value="{conf:.2f}" max="1" style="width:120px"></progress>'
+            rows.append(f"<tr><td>{i}</td><td>{badge}</td><td>{conf:.3f} {bar}</td></tr>")
+
+        table_html = f"""
+        <table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+          <thead>
+            <tr style="background:#f0f4ff;">
+              <th style="padding:8px; text-align:left;">#</th>
+              <th style="padding:8px; text-align:left;">Class</th>
+              <th style="padding:8px; text-align:left;">Confidence</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>"""
+        st.markdown(table_html, unsafe_allow_html=True)
+
+        # ── Download annotated image ─────────────────────────────────────
+        st.divider()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            Image.fromarray(annotated_rgb).save(tmp.name, quality=95)
+            with open(tmp.name, "rb") as f:
+                st.download_button(
+                    label="⬇️ Download annotated image",
+                    data=f.read(),
+                    file_name=f"detection_{uploaded.name}",
+                    mime="image/jpeg",
+                )
+
     else:
-        uploaded_file = st.file_uploader("Choose an image...", type=['jpg', 'jpeg', 'png'])
-        
-        if uploaded_file:
-            # Convert to RGB to handle RGBA/Alpha channel issues
-            image = Image.open(uploaded_file).convert("RGB")
-            
-            with st.spinner("Analyzing water safety..."):
-                result_img, counts = process_image(model, image, conf_threshold)
-                
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.image(image, caption="Original Input", use_container_width=True)
-                with c2:
-                    st.image(result_img, caption="Model Prediction", use_container_width=True)
-                
-                st.divider()
-                res_col1, res_col2 = st.columns(2)
-                with res_col1:
-                    if counts["Drowning"] > 0:
-                        st.error(f"🚨 ALERT: {counts['Drowning']} Drowning detected!")
-                    else:
-                        st.success("✅ No Drowning detected.")
-                with res_col2:
-                    st.info(f"🏊 Swimming detected: {counts['Swimming']}")
+        st.warning("⚠️ No objects detected. Try lowering the confidence threshold.")
 
-# --- TAB 3: TECHNICAL REPORT ---
-with tab3:
-    st.subheader("Deployment & Environment")
-    st.write("Current Status: **Production Ready**")
-    st.markdown("""
-    - **Runtime:** Python 3.11 (via runtime.txt)
-    - **OpenCV:** Headless version (for Cloud compatibility)
-    - **Hardware:** Optimized for CPU/GPU Inference
+else:
+    st.info("👆 Upload an image above to get started.")
+
+    # Show example class legend
+    st.markdown("### 🏷️ Detectable Classes")
+    c1, c2 = st.columns(2)
+    c1.markdown("""
+    **🧠 Head**
+    - Unprotected / bare head  
+    - Precision: 0.946 | Recall: 0.910  
+    - mAP50: 0.963
     """)
-    
-    st.subheader("Project Roadmap")
-    st.markdown("- CCTV RTSP Integration\n- Real-time Alerting (SMS)\n- Human Pose Analysis")
-
-# =========================================
-# FOOTER
-# =========================================
-st.markdown("---")
-st.caption(f"© 2026 {PROJECT_NAME} | Built with Streamlit and YOLOv8")
+    c2.markdown("""
+    **⛑️ Helmet**
+    - Safety / hard hat  
+    - Precision: 0.939 | Recall: 0.841  
+    - mAP50: 0.899
+    """)
